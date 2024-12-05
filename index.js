@@ -94,8 +94,9 @@ app.get('/user/files', async (req, res) => {
     try {
         await sftp.connect({ host: serverIP, port: 22, username, password });
         const files = await sftp.list(`/home/${username}`);
-        console.log(`Fichiers récupérés pour l'utilisateur ${username} :`, files.map(file => file.name));
-        res.json(files.map(file => file.name));
+        const visibleFiles = files.filter(file => !file.name.startsWith('.')); // Filtrer les fichiers masqués
+        console.log(`Fichiers visibles pour l'utilisateur ${username} :`, visibleFiles.map(file => file.name));
+        res.json(visibleFiles.map(file => file.name));
     } catch (err) {
         console.error('Erreur lors de la récupération des fichiers pour l\'utilisateur', username, ':', err.message);
         res.status(500).send('Erreur lors de la récupération des fichiers.');
@@ -103,6 +104,53 @@ app.get('/user/files', async (req, res) => {
         await sftp.end();
     }
 });
+
+app.post('/user/files/delete', async (req, res) => {
+    const { username, password } = req.session.sshConfig;
+    const { fileName } = req.body;
+
+    const sftp = new SFTPClient();
+    const remotePath = `/home/${username}/${fileName}`;
+
+    console.log(`Tentative de suppression du fichier ${fileName} pour l'utilisateur :`, username);
+
+    try {
+        await sftp.connect({ host: serverIP, port: 22, username, password });
+        await sftp.delete(remotePath);
+        console.log(`Fichier ${fileName} supprimé pour l'utilisateur :`, username);
+        res.status(200).send(`Fichier ${fileName} supprimé.`);
+    } catch (err) {
+        console.error('Erreur lors de la suppression du fichier', fileName, ':', err.message);
+        res.status(500).send(`Erreur lors de la suppression : ${err.message}`);
+    } finally {
+        await sftp.end();
+    }
+});
+
+
+app.post('/user/files/share', async (req, res) => {
+    const { username, password } = req.session.sshConfig;
+    const { fileName, targetUser } = req.body;
+
+    const sftp = new SFTPClient();
+    const sourcePath = `/home/${username}/${fileName}`;
+    const targetPath = `/home/${targetUser}/${fileName}`;
+
+    console.log(`Tentative de partage du fichier ${fileName} de ${username} à ${targetUser}.`);
+
+    try {
+        await sftp.connect({ host: serverIP, port: 22, username, password });
+        await sftp.fastPut(sourcePath, targetPath);
+        console.log(`Fichier ${fileName} partagé avec succès de ${username} à ${targetUser}.`);
+        res.status(200).send(`Fichier ${fileName} partagé avec ${targetUser}.`);
+    } catch (err) {
+        console.error('Erreur lors du partage du fichier', fileName, ':', err.message);
+        res.status(500).send(`Erreur lors du partage : ${err.message}`);
+    } finally {
+        await sftp.end();
+    }
+});
+
 
 app.post('/upload', upload.single('file'), async (req, res) => {
     const { username, password } = req.session.sshConfig;
