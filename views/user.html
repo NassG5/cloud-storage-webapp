@@ -3,37 +3,101 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard</title>
+    <title>Espace utilisateur</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha3/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body class="bg-light">
     <div class="container py-5">
-        <h1>Bienvenue, utilisateur</h1>
-        <h3>Vos fichiers</h3>
-        <ul id="fileList" class="list-group"></ul>
+        <h1 class="text-center mb-4">Espace utilisateur</h1>
 
-        <h3 class="mt-5">Uploader un fichier</h3>
-        <form action="/upload" method="POST" enctype="multipart/form-data">
-            <div class="input-group">
-                <input type="file" name="file" class="form-control" required>
-                <button type="submit" class="btn btn-primary">Uploader</button>
-            </div>
-        </form>
+        <!-- Liste des fichiers -->
+        <div class="mb-4">
+            <h3>Vos fichiers</h3>
+            <ul id="fileList" class="list-group"></ul>
+        </div>
 
-        <h3 class="mt-5">Partager un fichier</h3>
-        <form action="/user/files/share" method="POST">
-            <div class="mb-3">
-                <label for="fileName" class="form-label">Nom du fichier :</label>
-                <input type="text" id="fileName" name="fileName" class="form-control" required>
-            </div>
-            <div class="mb-3">
-                <label for="targetUser" class="form-label">Utilisateur cible :</label>
-                <input type="text" id="targetUser" name="targetUser" class="form-control" required>
-            </div>
-            <button type="submit" class="btn btn-primary">Partager</button>
-        </form>
+        <!-- Formulaire d'upload -->
+        <div class="mb-4">
+            <h3>Uploader un fichier</h3>
+            <form action="/upload" method="POST" enctype="multipart/form-data" id="uploadForm">
+                <div class="input-group">
+                    <input type="file" name="file" class="form-control" required>
+                    <button type="submit" class="btn btn-primary">Uploader</button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Partager un fichier -->
+        <div class="mb-4">
+            <h3>Partager un fichier</h3>
+            <form action="/user/files/share" method="POST">
+                <div class="mb-3">
+                    <label for="fileName" class="form-label">Nom du fichier :</label>
+                    <input type="text" id="fileName" name="fileName" class="form-control" required>
+                </div>
+                <div class="mb-3">
+                    <label for="targetUser" class="form-label">Utilisateur cible :</label>
+                    <input type="text" id="targetUser" name="targetUser" class="form-control" required>
+                </div>
+                <button type="submit" class="btn btn-success">Partager</button>
+            </form>
+        </div>
+
+        <!-- Déconnexion -->
+        <div class="text-center">
+            <a href="/logout" class="btn btn-danger">Se déconnecter</a>
+        </div>
     </div>
 
-    <script src="/scripts.js"></script>
+    <!-- Script pour gérer la liste des fichiers -->
+    <script>
+        // Récupérer la liste des fichiers
+        fetch('/user/files')
+            .then(response => response.json())
+            .then(files => {
+                const fileList = document.getElementById('fileList');
+                fileList.innerHTML = '';
+
+                if (files.length === 0) {
+                    fileList.innerHTML = '<li class="list-group-item">Aucun fichier trouvé.</li>';
+                    return;
+                }
+
+                files.forEach(file => {
+                    const li = document.createElement('li');
+                    li.className = 'list-group-item d-flex justify-content-between align-items-center';
+                    li.textContent = file;
+
+                    const actionsDiv = document.createElement('div');
+
+                    // Bouton de téléchargement
+                    const downloadBtn = document.createElement('a');
+                    downloadBtn.href = `/user/files/download/${file}`;
+                    downloadBtn.textContent = 'Télécharger';
+                    downloadBtn.className = 'btn btn-sm btn-primary me-2';
+                    actionsDiv.appendChild(downloadBtn);
+
+                    // Bouton de suppression
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.textContent = 'Supprimer';
+                    deleteBtn.className = 'btn btn-sm btn-danger';
+                    deleteBtn.onclick = () => {
+                        fetch('/user/files/delete', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ fileName: file })
+                        }).then(() => location.reload());
+                    };
+                    actionsDiv.appendChild(deleteBtn);
+
+                    li.appendChild(actionsDiv);
+                    fileList.appendChild(li);
+                });
+            })
+            .catch(err => {
+                console.error('Erreur lors du chargement des fichiers :', err);
+                alert('Erreur lors du chargement des fichiers. Veuillez réessayer plus tard.');
+            });
+    </script>
 </body>
 </html>

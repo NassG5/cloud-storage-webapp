@@ -1,187 +1,217 @@
+require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const session = require('express-session');
 const multer = require('multer');
-const path = require('path');
-const dotenv = require('dotenv');
-const SFTPClient = require('ssh2-sftp-client');
 const fs = require('fs');
-const vault = require('node-vault');
+const path = require('path');
+const crypto = require('crypto');
+const vault = require('node-vault')({
+    endpoint: process.env.VAULT_ENDPOINT,
+    token: process.env.VAULT_TOKEN,
+});
+const SFTPClient = require('ssh2-sftp-client');
 
-dotenv.config();
-
-const serverIP = process.env.SFTP_SERVER_IP;
-const vaultClient = vault({ endpoint: process.env.VAULT_ENDPOINT, token: process.env.VAULT_TOKEN });
 const app = express();
 const port = 3000;
 
-let sessionSecret = 'fallback_secret_key';
-
-// Récupérer la clé depuis Vault
-(async () => {
-    try {
-        const secret = await vaultClient.read(process.env.SESSION_KEY_PATH);
-        sessionSecret = secret.data.secret_key;
-        console.log('Clé de session récupérée depuis Vault avec succès.');
-    } catch (err) {
-        console.error('Erreur lors de la récupération de la clé depuis Vault :', err.message);
-        console.log('Utilisation de la clé de session par défaut.');
-    }
-})();
-
-// Middleware de session
-app.use(session({
-    secret: sessionSecret,
-    resave: false,
-    saveUninitialized: true,
-    cookie: { secure: false, httpOnly: true },
-}));
-
+// Middleware
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static('public'));
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'fallback_secret',
+    resave: false,
+    saveUninitialized: true,
+}));
+
 const upload = multer({ dest: 'uploads/' });
 
-function validateInput(input) {
-    const regex = /^[a-zA-Z0-9@._-]+$/;
-    return regex.test(input);
-}
-
+// Routes
 app.get('/', (req, res) => {
-    console.log('Accès à la page de connexion.');
     res.sendFile(path.join(__dirname, 'views', 'login.html'));
 });
 
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
-
-    console.log('Tentative de connexion pour l\'utilisateur :', username);
-
-    if (!validateInput(username) || !validateInput(password)) {
-        console.log('Validation des entrées échouée pour l\'utilisateur :', username);
-        return res.status(400).send('Entrées invalides.');
-    }
-
-    const sftp = new SFTPClient();
-    try {
-        console.log('Connexion SFTP en cours...');
-        await sftp.connect({ host: serverIP, port: 22, username, password });
-        console.log('Connexion SFTP réussie pour l\'utilisateur :', username);
-        req.session.sshConfig = { username, password };
-        req.session.isAuthenticated = true;
-        await sftp.end();
-        res.redirect('/user');
-    } catch (err) {
-        console.error('Erreur de connexion SFTP pour l\'utilisateur', username, ':', err.message);
-        res.status(401).send(`Connexion échouée : ${err.message}`);
-    }
+    req.session.sshConfig = { username, password };
+    req.session.isAuthenticated = true;
+    res.redirect('/user');
 });
 
 app.get('/user', (req, res) => {
     if (!req.session.isAuthenticated) {
-        console.log('Accès non autorisé à /user. Redirection vers /');
         return res.redirect('/');
     }
-    console.log('Accès autorisé à /user pour l\'utilisateur :', req.session.sshConfig.username);
     res.sendFile(path.join(__dirname, 'views', 'user.html'));
 });
 
+// Function to encrypt files
+async function encryptFile(filePath, encryptedPath) {
+    const algorithm = 'aes-256-cbc';
+    const key = crypto.randomBytes(32);
+    const iv = crypto.randomBytes(16);
+
+    return new Promise((resolve, reject) => {
+        const cipher = crypto.createCipheriv(algorithm, key, iv);
+        const input = fs.createReadStream(filePath);
+        const output = fs.createWriteStream(encryptedPath);
+
+        input.pipe(cipher).pipe(output);
+
+        output.on('finish', async () => {
+            const fileName = path.basename(encryptedPath);
+            try {
+                await vault.write(`secret/encrypted_files/${fileName}`, {
+                    key: key.toString('hex'),
+                    iv: iv.toString('hex'),
+                });
+                resolve();
+            } catch (err) {
+                reject(err);
+            }
+        });
+
+        output.on('error', (err) => reject(err));
+    });
+}
+
+// Route to list files
 app.get('/user/files', async (req, res) => {
     const { username, password } = req.session.sshConfig;
     const sftp = new SFTPClient();
 
-    console.log('Récupération des fichiers pour l\'utilisateur :', username);
-
     try {
-        await sftp.connect({ host: serverIP, port: 22, username, password });
+        console.log(`Connexion au SFTP pour l'utilisateur : ${username}`);
+        await sftp.connect({ host: process.env.SFTP_HOST, port: 22, username, password });
+
         const files = await sftp.list(`/home/${username}`);
-        const visibleFiles = files.filter(file => !file.name.startsWith('.')); // Filtrer les fichiers masqués
-        console.log(`Fichiers visibles pour l'utilisateur ${username} :`, visibleFiles.map(file => file.name));
-        res.json(visibleFiles.map(file => file.name));
+        const visibleFiles = files.filter(file => !file.name.startsWith('.')).map(file => file.name);
+
+        res.json(visibleFiles);
     } catch (err) {
-        console.error('Erreur lors de la récupération des fichiers pour l\'utilisateur', username, ':', err.message);
+        console.error('Erreur lors de la récupération des fichiers :', err.message);
         res.status(500).send('Erreur lors de la récupération des fichiers.');
     } finally {
         await sftp.end();
     }
 });
 
-app.post('/user/files/delete', async (req, res) => {
+// Route to upload files
+app.post('/upload', upload.single('file'), async (req, res) => {
     const { username, password } = req.session.sshConfig;
-    const { fileName } = req.body;
+    const localPath = req.file.path; // Chemin temporaire du fichier uploadé
+    const encryptedPath = `${localPath}.enc`; // Chemin pour le fichier chiffré
+    const remotePath = `/home/${username}/${req.file.originalname}.enc`; // Chemin distant sur le serveur SFTP
 
     const sftp = new SFTPClient();
-    const remotePath = `/home/${username}/${fileName}`;
-
-    console.log(`Tentative de suppression du fichier ${fileName} pour l'utilisateur :`, username);
 
     try {
-        await sftp.connect({ host: serverIP, port: 22, username, password });
-        await sftp.delete(remotePath);
-        console.log(`Fichier ${fileName} supprimé pour l'utilisateur :`, username);
-        res.status(200).send(`Fichier ${fileName} supprimé.`);
+        console.log('--- Début de la route /upload ---');
+        console.log(`Fichier uploadé reçu : ${localPath}`);
+        console.log(`Chemin prévu pour le fichier chiffré : ${encryptedPath}`);
+        console.log(`Chemin distant prévu pour l'upload : ${remotePath}`);
+
+        // Étape 1 : Chiffrement du fichier
+        console.log('Chiffrement du fichier...');
+        await encryptFile(localPath, encryptedPath);
+        console.log(`Fichier chiffré avec succès : ${encryptedPath}`);
+
+        // Étape 2 : Connexion au SFTP
+        console.log('Connexion au serveur SFTP...');
+        await sftp.connect({ host: process.env.SFTP_HOST, port: 22, username, password });
+        console.log('Connexion SFTP réussie.');
+
+        // Étape 3 : Upload du fichier chiffré
+        console.log(`Upload du fichier vers : ${remotePath}`);
+        await sftp.put(encryptedPath, remotePath);
+        console.log(`Fichier uploadé avec succès vers ${remotePath}`);
+
+        res.send('Fichier chiffré et uploadé avec succès.');
     } catch (err) {
-        console.error('Erreur lors de la suppression du fichier', fileName, ':', err.message);
-        res.status(500).send(`Erreur lors de la suppression : ${err.message}`);
+        console.error('Erreur lors de la route /upload :', err.message);
+        res.status(500).send(`Erreur lors de l'upload : ${err.message}`);
     } finally {
+        console.log('Nettoyage des fichiers temporaires...');
+        if (fs.existsSync(localPath)) {
+            console.log(`Suppression du fichier temporaire local : ${localPath}`);
+            fs.unlinkSync(localPath);
+        }
+        if (fs.existsSync(encryptedPath)) {
+            console.log(`Suppression du fichier temporaire chiffré : ${encryptedPath}`);
+            fs.unlinkSync(encryptedPath);
+        }
         await sftp.end();
+        console.log('--- Fin de la route /upload ---');
     }
 });
 
 
+// Route to share files
 app.post('/user/files/share', async (req, res) => {
     const { username, password } = req.session.sshConfig;
     const { fileName, targetUser } = req.body;
 
     const sftp = new SFTPClient();
-    const sourcePath = `/home/${username}/${fileName}`;
-    const targetPath = `/home/${targetUser}/${fileName}`;
-
-    console.log(`Tentative de partage du fichier ${fileName} de ${username} à ${targetUser}.`);
+    const sourcePath = `/home/${username}/${fileName}.enc`;
+    const targetPath = `/home/${targetUser}/${fileName}.enc`;
 
     try {
-        await sftp.connect({ host: serverIP, port: 22, username, password });
+        await sftp.connect({ host: process.env.SFTP_HOST, port: 22, username, password });
         await sftp.fastPut(sourcePath, targetPath);
-        console.log(`Fichier ${fileName} partagé avec succès de ${username} à ${targetUser}.`);
-        res.status(200).send(`Fichier ${fileName} partagé avec ${targetUser}.`);
+        res.send(`Fichier partagé avec succès avec ${targetUser}.`);
     } catch (err) {
-        console.error('Erreur lors du partage du fichier', fileName, ':', err.message);
-        res.status(500).send(`Erreur lors du partage : ${err.message}`);
+        console.error('Erreur lors du partage :', err.message);
+        res.status(500).send('Erreur lors du partage.');
     } finally {
         await sftp.end();
     }
 });
 
-
-app.post('/upload', upload.single('file'), async (req, res) => {
+// Route to download files
+app.get('/user/files/download/:fileName', async (req, res) => {
     const { username, password } = req.session.sshConfig;
-    const localPath = req.file.path;
-    const remotePath = `/home/${username}/${req.file.originalname}`;
+    const fileName = req.params.fileName;
+    const encryptedPath = `/home/${username}/${fileName}.enc`;
+    const localEncryptedPath = `./uploads/${fileName}.enc`;
+    const localDecryptedPath = `./uploads/${fileName}`;
     const sftp = new SFTPClient();
 
-    console.log(`Tentative d'upload du fichier ${req.file.originalname} pour l'utilisateur :`, username);
-
     try {
-        await sftp.connect({ host: serverIP, port: 22, username, password });
-        await sftp.put(localPath, remotePath);
-        console.log(`Upload réussi du fichier ${req.file.originalname} pour l'utilisateur :`, username);
-        res.redirect('/user');
+        await sftp.connect({ host: process.env.SFTP_HOST, port: 22, username, password });
+        await sftp.get(encryptedPath, localEncryptedPath);
+
+        const secret = await vault.read(`secret/encrypted_files/${fileName}`);
+        const key = Buffer.from(secret.data.key, 'hex');
+        const iv = Buffer.from(secret.data.iv, 'hex');
+
+        const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+        const input = fs.createReadStream(localEncryptedPath);
+        const output = fs.createWriteStream(localDecryptedPath);
+
+        input.pipe(decipher).pipe(output);
+
+        output.on('finish', () => {
+            res.download(localDecryptedPath, fileName, () => {
+                if (fs.existsSync(localEncryptedPath)) fs.unlinkSync(localEncryptedPath);
+                if (fs.existsSync(localDecryptedPath)) fs.unlinkSync(localDecryptedPath);
+            });
+        });
     } catch (err) {
-        console.error('Erreur lors de l\'upload du fichier', req.file.originalname, 'pour l\'utilisateur', username, ':', err.message);
-        res.status(500).send(`Erreur lors de l'upload : ${err.message}`);
+        console.error('Erreur lors du téléchargement/déchiffrement :', err.message);
+        res.status(500).send('Erreur lors du téléchargement.');
     } finally {
-        if (fs.existsSync(localPath)) {
-            fs.unlinkSync(localPath);
-            console.log('Fichier temporaire local supprimé :', localPath);
-        }
         await sftp.end();
     }
 });
 
+// Logout
 app.get('/logout', (req, res) => {
-    console.log('Déconnexion pour l\'utilisateur :', req.session.sshConfig?.username);
-    req.session.destroy(() => res.redirect('/'));
+    req.session.destroy(() => {
+        res.redirect('/');
+    });
 });
 
+// Start the server
 app.listen(port, () => {
     console.log(`Serveur démarré sur http://localhost:${port}`);
 });
