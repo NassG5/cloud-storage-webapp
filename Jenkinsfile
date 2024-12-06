@@ -15,6 +15,7 @@ pipeline {
                     host: env.KALI_HOST,
                     user: env.KALI_USER,
                     credentialsId: 'c5b5ceae-eb62-4475-bd1b-6d952959d770'
+		    allowAnyHosts: true
                 ], command: '''
                 python3 /home/kali/zap_auto.py
                 '''
@@ -28,6 +29,7 @@ pipeline {
                     host: env.KALI_HOST,
                     user: env.KALI_USER,
                     credentialsId: 'c5b5ceae-eb62-4475-bd1b-6d952959d770'
+		    allowAnyHosts: true
                 ], command: '''
                 cd /home/kali
                 if [ -d cloud-storage-webapp ]; then
